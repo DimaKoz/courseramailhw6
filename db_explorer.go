@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -42,7 +43,7 @@ func (rErr RespError) PrepApiAnswer() []byte {
 	return []byte("{ \"error\":\"" + rErr.Error + "\"}")
 }
 
-//This function sends a RespError to a passed http.ResponseWriter
+//This function writes a RespError to a passed http.ResponseWriter
 func (rErr RespError) serve(w http.ResponseWriter) {
 	apiData := rErr.PrepApiAnswer()
 	w.Header().Set("Content-Type", http.DetectContentType(apiData))
@@ -179,6 +180,9 @@ func serveListTables(w http.ResponseWriter, desc DbDesc) {
 	for key, _ := range desc.tables {
 		resp.Response.Tables = append(resp.Response.Tables, key)
 	}
+	sort.Slice(resp.Response.Tables, func(i, j int) bool {
+		return resp.Response.Tables[i] < resp.Response.Tables[j]
+	})
 	serveAnswer(w, resp)
 }
 
