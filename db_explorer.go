@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -24,6 +25,32 @@ type TableDesc struct {
 
 type FieldDesc struct {
 	Name string
+}
+
+var errNotFound = RespError{HTTPStatus: http.StatusNotFound, Error: "Not Found"}
+var errUnknownTable = RespError{HTTPStatus: http.StatusNotFound, Error: "unknown table"}
+var errInternalError = RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}
+
+//RespError represents an error of API
+type RespError struct {
+	Error      string
+	HTTPStatus int
+}
+
+//PrepApiAnswer returns bytes for an answer with the error
+func (rErr RespError) PrepApiAnswer() []byte {
+	return []byte("{ \"error\":\"" + rErr.Error + "\"}")
+}
+
+//This function sends a RespError to a passed http.ResponseWriter
+func (rErr RespError) serve(w http.ResponseWriter) {
+	apiData := rErr.PrepApiAnswer()
+	w.Header().Set("Content-Type", http.DetectContentType(apiData))
+	w.WriteHeader(rErr.HTTPStatus)
+	_, err := w.Write(apiData)
+	if err != nil {
+		log.Println(err.Error())
+	}
 }
 
 type Tables struct {
@@ -75,6 +102,7 @@ func (l *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	switch r.Method {
+
 	case http.MethodGet:
 		serveGet(w, r, l)
 
@@ -88,9 +116,9 @@ func (l *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		serveDelete(w, r, l)
 
 	default:
-		//we have to send http.StatusInternalServerError when any error occurs
-		http.Error(w, "Method not allowed", http.StatusInternalServerError /*http.StatusMethodNotAllowed*/)
-		return
+		//we have to send http.StatusInternalServerError when any error occurs instead of http.StatusMethodNotAllowed
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Method not allowed"}.serve(w)
+
 	}
 
 	log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
@@ -115,12 +143,58 @@ func servePost(w http.ResponseWriter, r *http.Request, l *Router) {
 func serveGet(w http.ResponseWriter, r *http.Request, l *Router) {
 	log.Printf("serveGet %s %s", r.Method, r.URL.Path)
 
+	if r.URL.Path == "/" {
+		serveListTables(w, l.desc)
+		return
+	}
+
+	pathSegments := strings.Split(r.URL.Path[:0], "/")
+	log.Printf("pathSegments %d %s", len(pathSegments), pathSegments)
+	switch len(pathSegments) {
+	case 1:
+		serveListFields(w, l.desc, pathSegments[0])
+
+	case 2:
+		//TODO the proper answer
+		errInternalError.serve(w)
+	default:
+		errNotFound.serve(w)
+
+	}
+
+}
+
+func serveListFields(w http.ResponseWriter, desc DbDesc, tableName string) {
+	if found, ok := desc.tables[tableName]; ok {
+		log.Println("found description:", found)
+		//TODO a good answer, errInternalError is a stub
+		errInternalError.serve(w)
+	} else {
+		errUnknownTable.serve(w)
+	}
+}
+
+func serveListTables(w http.ResponseWriter, desc DbDesc) {
 	resp := RespTables{}
-	for key, _ := range l.desc.tables {
+	for key, _ := range desc.tables {
 		resp.Response.Tables = append(resp.Response.Tables, key)
 	}
-	b, _ := json.Marshal(resp)
-	w.Write(b)
+	serveAnswer(w, resp)
+}
+
+func serveAnswer(w http.ResponseWriter, v interface{}) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("can't json.Marshal by err [%s] with:\n %+v\n", err.Error(), v)
+		errInternalError.serve(w)
+		return
+	}
+	w.Header().Set("Content-Type", http.DetectContentType(data))
+	w.WriteHeader(http.StatusOK)
+	_, err = w.Write(data)
+	if err != nil {
+		log.Println("can't serve:" + err.Error())
+	}
 }
 
 //NewRouter constructs a new Router middleware handler
