@@ -216,6 +216,12 @@ func getTables(db *sql.DB) (tables []string, err error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		err = res.Close()
+		if err != nil {
+			log.Println("error while closing rows:", err)
+		}
+	}()
 	var table string
 
 	for res.Next() {
