@@ -4,9 +4,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -25,7 +29,34 @@ type TableDesc struct {
 }
 
 type FieldDesc struct {
-	Name string
+	IndexInTable int
+	Name         string
+	Type         string
+	Nullable     bool
+	IsPrimaryKey bool
+}
+
+func (field FieldDesc) getDefault() interface{} {
+	if field.Nullable {
+		return nil
+	} else {
+		if field.Type == "int" {
+			return 0
+		} else {
+			return ""
+		}
+	}
+}
+
+func (tDesc TableDesc) getFieldsArray() []FieldDesc {
+	result := make([]FieldDesc, 0, len(tDesc.fields))
+	for _, value := range tDesc.fields {
+		result = append(result, value)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].IndexInTable < result[j].IndexInTable
+	})
+	return result
 }
 
 var errNotFound = RespError{HTTPStatus: http.StatusNotFound, Error: "Not Found"}
@@ -85,10 +116,63 @@ func initExplorer(db *sql.DB) (*DbDesc, error) {
 	}
 	result := DbDesc{make(map[string]TableDesc)}
 	for _, tableName := range knownTableNames {
-		//TODO gather information about tables
-		result.tables[tableName] = TableDesc{tableName, nil /*stub*/}
+		fields, err := getFields(db, tableName)
+		if err != nil {
+			return nil, err
+		}
+		result.tables[tableName] = TableDesc{tableName, fields}
+
 	}
 	return &result, nil
+}
+
+func getFields(db *sql.DB, name string) (map[string]FieldDesc, error) {
+
+	fRows, err := db.Query("SHOW COLUMNS FROM " + name + ";")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		err = fRows.Close()
+		if err != nil {
+			log.Println("error while closing rows:", err)
+		}
+	}()
+	cols, err := fRows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	vals := make([]interface{}, len(cols))
+	for i, _ := range cols {
+		vals[i] = new(sql.RawBytes)
+	}
+
+	fields := make(map[string]FieldDesc, len(vals))
+	idx := -1
+	for fRows.Next() {
+		idx++
+		err = fRows.Scan(vals...)
+		if err != nil {
+			return nil, err
+		}
+		fDesc := FieldDesc{}
+		fDesc.IndexInTable = idx
+		for i, col := range cols {
+			switch col {
+			case "Field":
+				fDesc.Name = string(*reflect.ValueOf(vals[i]).Interface().(*sql.RawBytes))
+			case "Type":
+				fDesc.Type = string(*reflect.ValueOf(vals[i]).Interface().(*sql.RawBytes))
+			case "Null":
+				fDesc.Nullable = string(*reflect.ValueOf(vals[i]).Interface().(*sql.RawBytes)) == "YES"
+			case "Key":
+				fDesc.IsPrimaryKey = string(*reflect.ValueOf(vals[i]).Interface().(*sql.RawBytes)) == "PRI"
+			}
+		}
+		fields[fDesc.Name] = fDesc
+	}
+
+	return fields, nil
 }
 
 //Router is a handler
@@ -128,6 +212,88 @@ func (l *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //serveGet serves for http.MethodPut requests
 func servePut(w http.ResponseWriter, r *http.Request, l *Router) {
 	log.Printf("servePut %s %s", r.Method, r.URL.Path)
+
+	pathSegments := strings.Split(r.URL.Path, "/")
+	if len(pathSegments) < 2 {
+		errUnknownTable.serve(w)
+		return
+	}
+	searchTable := pathSegments[1]
+
+	var ok bool
+	var foundTable TableDesc
+	if foundTable, ok = l.desc.tables[searchTable]; !ok {
+		errUnknownTable.serve(w)
+		return
+	}
+
+	fmt.Println("foundTable", foundTable)
+
+	//read
+	decoder := json.NewDecoder(r.Body)
+	requestedParams := make(map[string]interface{}, len(foundTable.fields))
+	err := decoder.Decode(&requestedParams)
+	if err != nil {
+		errInternalError.serve(w)
+		return
+	}
+	defer func() {
+		err = r.Body.Close()
+		if err != nil {
+			log.Println("error while closing Body:", err)
+		}
+	}()
+	log.Println("requestedParams", requestedParams)
+	fields := foundTable.getFieldsArray()
+	sqlQuery := foundTable.prepInsertSqlQuery()
+	log.Println("prepared sql query:", sqlQuery)
+
+	result := make([]interface{}, len(fields))
+
+	var idx = -1
+	for _, field := range fields {
+		idx++
+		//assume that a Primary Key always has auto increment
+		//so we don't use a got value for this field
+		if field.IsPrimaryKey {
+			result[idx] = field.getDefault()
+			continue
+		}
+		if found, ok := requestedParams[field.Name]; !ok || found == nil {
+			result[idx] = field.getDefault()
+		} else {
+			result[idx] = found
+		}
+	}
+
+	res, err := l.db.Exec(sqlQuery, result...)
+	if err != nil {
+		errInternalError.serve(w)
+		log.Println("db.Exec with err:", err, " passed values:", result)
+		return
+	}
+
+	id, err := res.LastInsertId()
+	if err != nil {
+		log.Println("LastInsertId err:", err)
+		errInternalError.serve(w)
+		return
+	}
+	serveAnswer(w, map[string]interface{}{"response": map[string]interface{}{"id": id}})
+}
+
+func (tDesc TableDesc) prepInsertSqlQuery() string {
+	fields := tDesc.getFieldsArray()
+	fieldsNumber := len(fields)
+	values := make([]string, fieldsNumber)
+	placeholders := make([]string, fieldsNumber)
+	var index = -1
+	for /*key*/ _, field := range fields {
+		index++
+		values[index] = field.Name
+		placeholders[index] = "?"
+	}
+	return fmt.Sprintf("insert into %s (%s) values (%s)", tDesc.Name, strings.Join(values, ", "), strings.Join(placeholders, ", "))
 }
 
 //serveGet serves for http.MethodDelete requests
@@ -149,15 +315,15 @@ func serveGet(w http.ResponseWriter, r *http.Request, l *Router) {
 		return
 	}
 
-	pathSegments := strings.Split(r.URL.Path[:0], "/")
+	pathSegments := strings.Split(r.URL.Path[1:], "/")
 	log.Printf("pathSegments %d %s", len(pathSegments), pathSegments)
 	switch len(pathSegments) {
 	case 1:
-		serveListFields(w, l.desc, pathSegments[0])
+		serveListRows(l.db, w, l.desc, pathSegments[0], r.URL.Query())
 
 	case 2:
-		//TODO the proper answer
-		errInternalError.serve(w)
+		serveRowById(l.db, w, l.desc, pathSegments[0], pathSegments[1])
+
 	default:
 		errNotFound.serve(w)
 
@@ -165,14 +331,158 @@ func serveGet(w http.ResponseWriter, r *http.Request, l *Router) {
 
 }
 
-func serveListFields(w http.ResponseWriter, desc DbDesc, tableName string) {
-	if found, ok := desc.tables[tableName]; ok {
-		log.Println("found description:", found)
-		//TODO a good answer, errInternalError is a stub
-		errInternalError.serve(w)
+func serveRowById(db *sql.DB, w http.ResponseWriter, desc DbDesc, tableName string, id string) {
+	if foundTable, ok := desc.tables[tableName]; ok {
+		sqlQ := fmt.Sprintf("SELECT * FROM %s WHERE id = ?", tableName)
+		res, err := db.Query(sqlQ, id)
+		if err != nil {
+			errInternalError.serve(w)
+			log.Println(err)
+			return
+		}
+		defer func() {
+			err = res.Close()
+			if err != nil {
+				log.Println("error while closing rows:", err)
+			}
+		}()
+
+		cols, err := res.Columns()
+		if err != nil {
+			errInternalError.serve(w)
+			log.Println(err)
+			return
+		}
+		vals := make([]interface{}, len(cols))
+		for i, _ := range cols {
+			vals[i] = new(sql.RawBytes)
+		}
+
+		rows := make([]interface{}, 0)
+		for res.Next() {
+			err = res.Scan(vals...)
+			if err != nil {
+				errInternalError.serve(w)
+				log.Println(err)
+				return
+			}
+			row := make(map[string]interface{})
+
+			for i, col := range cols {
+				var val = *reflect.ValueOf(vals[i]).Interface().(*sql.RawBytes)
+				if val != nil {
+					var field FieldDesc
+					if descField, ok := foundTable.fields[col]; ok {
+						field = descField
+					}
+					if field.Type == "int" {
+						r, _ := strconv.Atoi(string(val))
+						row[col] = r
+					} else {
+						row[col] = string(val)
+					}
+
+				} else {
+
+					row[col] = nil
+				}
+			}
+
+			rows = append(rows, row)
+		}
+		if len(rows) == 1 {
+			serveAnswer(w, map[string]interface{}{"response": map[string]interface{}{"record": rows[0]}})
+		} else {
+			RespError{HTTPStatus: http.StatusNotFound, Error: "record not found"}.serve(w)
+		}
+
 	} else {
 		errUnknownTable.serve(w)
 	}
+}
+
+func serveListRows(db *sql.DB, w http.ResponseWriter, desc DbDesc, tableName string, query url.Values) {
+	if found, ok := desc.tables[tableName]; ok {
+		log.Println("found description:", found)
+		limitStr := getIntValueAsStringFromQuery(query, "limit", "5")
+
+		offsetStr := getIntValueAsStringFromQuery(query, "offset", "0")
+
+		res2, err := db.Query("select * from " + tableName + " limit " + limitStr + " offset " + offsetStr)
+		if err != nil {
+			errInternalError.serve(w)
+			log.Println(err)
+			return
+		}
+
+		defer func() {
+			err = res2.Close()
+			if err != nil {
+				log.Println("error while closing rows:", err)
+			}
+		}()
+
+		cols, err := res2.Columns()
+		if err != nil {
+			errInternalError.serve(w)
+			log.Println(err)
+			return
+		}
+		vals := make([]interface{}, len(cols))
+		for i, _ := range cols {
+			vals[i] = new(sql.RawBytes)
+		}
+
+		rows := make([]interface{}, 0)
+		for res2.Next() {
+			err = res2.Scan(vals...)
+			if err != nil {
+				errInternalError.serve(w)
+				log.Println(err)
+				return
+			}
+			row := make(map[string]interface{})
+
+			for i, col := range cols {
+				var val = *reflect.ValueOf(vals[i]).Interface().(*sql.RawBytes)
+				if val != nil {
+					var field FieldDesc
+					if descField, ok := found.fields[col]; ok {
+						field = descField
+					}
+					if field.Type == "int" {
+						r, _ := strconv.Atoi(string(val))
+						row[col] = r
+					} else {
+						row[col] = string(val)
+					}
+
+				} else {
+
+					row[col] = nil
+				}
+			}
+
+			rows = append(rows, row)
+		}
+
+		serveAnswer(w, map[string]interface{}{"response": map[string]interface{}{"records": rows}})
+	} else {
+		errUnknownTable.serve(w)
+	}
+}
+
+func getIntValueAsStringFromQuery(query url.Values, key string, defaultValue string) string {
+	result := query.Get(key)
+	if result == "" {
+		result = defaultValue
+	} else { //to prevent injections
+		_, err := strconv.Atoi(result)
+		if err != nil {
+			result = defaultValue
+		}
+	}
+	return result
 }
 
 func serveListTables(w http.ResponseWriter, desc DbDesc) {
