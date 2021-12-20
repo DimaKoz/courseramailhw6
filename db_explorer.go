@@ -59,9 +59,6 @@ func (tDesc TableDesc) getFieldsArray() []FieldDesc {
 	return result
 }
 
-var errNotFound = RespError{HTTPStatus: http.StatusNotFound, Error: "Not Found"}
-var errUnknownTable = RespError{HTTPStatus: http.StatusNotFound, Error: "unknown table"}
-var errInternalError = RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}
 
 //RespError represents an error of API
 type RespError struct {
@@ -215,7 +212,7 @@ func servePut(w http.ResponseWriter, r *http.Request, l *Router) {
 
 	pathSegments := strings.Split(r.URL.Path, "/")
 	if len(pathSegments) < 2 {
-		errUnknownTable.serve(w)
+		RespError{HTTPStatus: http.StatusNotFound, Error: "unknown table"}.serve(w)
 		return
 	}
 	searchTable := pathSegments[1]
@@ -223,7 +220,7 @@ func servePut(w http.ResponseWriter, r *http.Request, l *Router) {
 	var ok bool
 	var foundTable TableDesc
 	if foundTable, ok = l.desc.tables[searchTable]; !ok {
-		errUnknownTable.serve(w)
+		RespError{HTTPStatus: http.StatusNotFound, Error: "unknown table"}.serve(w)
 		return
 	}
 
@@ -234,7 +231,7 @@ func servePut(w http.ResponseWriter, r *http.Request, l *Router) {
 	requestedParams := make(map[string]interface{}, len(foundTable.fields))
 	err := decoder.Decode(&requestedParams)
 	if err != nil {
-		errInternalError.serve(w)
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
 		return
 	}
 	defer func() {
@@ -268,7 +265,7 @@ func servePut(w http.ResponseWriter, r *http.Request, l *Router) {
 
 	res, err := l.db.Exec(sqlQuery, result...)
 	if err != nil {
-		errInternalError.serve(w)
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
 		log.Println("db.Exec with err:", err, " passed values:", result)
 		return
 	}
@@ -276,7 +273,7 @@ func servePut(w http.ResponseWriter, r *http.Request, l *Router) {
 	id, err := res.LastInsertId()
 	if err != nil {
 		log.Println("LastInsertId err:", err)
-		errInternalError.serve(w)
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
 		return
 	}
 	serveAnswer(w, map[string]interface{}{"response": map[string]interface{}{"id": id}})
@@ -325,7 +322,7 @@ func serveGet(w http.ResponseWriter, r *http.Request, l *Router) {
 		serveRowById(l.db, w, l.desc, pathSegments[0], pathSegments[1])
 
 	default:
-		errNotFound.serve(w)
+		RespError{HTTPStatus: http.StatusNotFound, Error: "Not Found"}.serve(w)
 
 	}
 
@@ -336,7 +333,7 @@ func serveRowById(db *sql.DB, w http.ResponseWriter, desc DbDesc, tableName stri
 		sqlQ := fmt.Sprintf("SELECT * FROM %s WHERE id = ?", tableName)
 		res, err := db.Query(sqlQ, id)
 		if err != nil {
-			errInternalError.serve(w)
+			RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
 			log.Println(err)
 			return
 		}
@@ -349,7 +346,7 @@ func serveRowById(db *sql.DB, w http.ResponseWriter, desc DbDesc, tableName stri
 
 		cols, err := res.Columns()
 		if err != nil {
-			errInternalError.serve(w)
+			RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
 			log.Println(err)
 			return
 		}
@@ -362,7 +359,7 @@ func serveRowById(db *sql.DB, w http.ResponseWriter, desc DbDesc, tableName stri
 		for res.Next() {
 			err = res.Scan(vals...)
 			if err != nil {
-				errInternalError.serve(w)
+				RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
 				log.Println(err)
 				return
 			}
@@ -397,7 +394,7 @@ func serveRowById(db *sql.DB, w http.ResponseWriter, desc DbDesc, tableName stri
 		}
 
 	} else {
-		errUnknownTable.serve(w)
+		RespError{HTTPStatus: http.StatusNotFound, Error: "unknown table"}.serve(w)
 	}
 }
 
@@ -410,7 +407,7 @@ func serveListRows(db *sql.DB, w http.ResponseWriter, desc DbDesc, tableName str
 
 		res2, err := db.Query("select * from " + tableName + " limit " + limitStr + " offset " + offsetStr)
 		if err != nil {
-			errInternalError.serve(w)
+			RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
 			log.Println(err)
 			return
 		}
@@ -424,7 +421,7 @@ func serveListRows(db *sql.DB, w http.ResponseWriter, desc DbDesc, tableName str
 
 		cols, err := res2.Columns()
 		if err != nil {
-			errInternalError.serve(w)
+			RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
 			log.Println(err)
 			return
 		}
@@ -437,7 +434,7 @@ func serveListRows(db *sql.DB, w http.ResponseWriter, desc DbDesc, tableName str
 		for res2.Next() {
 			err = res2.Scan(vals...)
 			if err != nil {
-				errInternalError.serve(w)
+				RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
 				log.Println(err)
 				return
 			}
@@ -468,7 +465,7 @@ func serveListRows(db *sql.DB, w http.ResponseWriter, desc DbDesc, tableName str
 
 		serveAnswer(w, map[string]interface{}{"response": map[string]interface{}{"records": rows}})
 	} else {
-		errUnknownTable.serve(w)
+		RespError{HTTPStatus: http.StatusNotFound, Error: "unknown table"}.serve(w)
 	}
 }
 
@@ -500,7 +497,7 @@ func serveAnswer(w http.ResponseWriter, v interface{}) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		log.Printf("can't json.Marshal by err [%s] with:\n %+v\n", err.Error(), v)
-		errInternalError.serve(w)
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
 		return
 	}
 	w.Header().Set("Content-Type", http.DetectContentType(data))
