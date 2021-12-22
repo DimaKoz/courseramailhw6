@@ -19,6 +19,15 @@ import (
 // обращаю ваше внимание - в этом задании запрещены глобальные переменные
 // Global variables are forbidden
 
+/*
+
+To install the right version of the DB(like version in grader):
+
+docker pull mariadb:10.3.17
+docker run -p 3306:3306 -v $(PWD):/docker-entrypoint-initdb.d -e MYSQL_ROOT_PASSWORD=1234 -e MYSQL_DATABASE=golang -d docker.io/library/mariadb:10.3.17
+
+*/
+
 type DbDesc struct {
 	tables map[string]TableDesc
 }
@@ -26,6 +35,18 @@ type DbDesc struct {
 type TableDesc struct {
 	Name   string
 	fields map[string]FieldDesc
+}
+
+func (tDesc TableDesc) getKeyField() *FieldDesc {
+	if len(tDesc.fields) == 0 {
+		return nil
+	}
+	for _, v := range tDesc.fields {
+		if v.IsPrimaryKey {
+			return &v
+		}
+	}
+	return nil
 }
 
 type FieldDesc struct {
@@ -58,7 +79,6 @@ func (tDesc TableDesc) getFieldsArray() []FieldDesc {
 	})
 	return result
 }
-
 
 //RespError represents an error of API
 type RespError struct {
@@ -159,7 +179,12 @@ func getFields(db *sql.DB, name string) (map[string]FieldDesc, error) {
 			case "Field":
 				fDesc.Name = string(*reflect.ValueOf(vals[i]).Interface().(*sql.RawBytes))
 			case "Type":
-				fDesc.Type = string(*reflect.ValueOf(vals[i]).Interface().(*sql.RawBytes))
+				typeRaw := string(*reflect.ValueOf(vals[i]).Interface().(*sql.RawBytes))
+				if strings.Contains(typeRaw, "int") {
+					fDesc.Type = "int"
+				} else {
+					fDesc.Type = string(*reflect.ValueOf(vals[i]).Interface().(*sql.RawBytes))
+				}
 			case "Null":
 				fDesc.Nullable = string(*reflect.ValueOf(vals[i]).Interface().(*sql.RawBytes)) == "YES"
 			case "Key":
@@ -246,7 +271,12 @@ func servePut(w http.ResponseWriter, r *http.Request, l *Router) {
 	log.Println("prepared sql query:", sqlQuery)
 
 	result := make([]interface{}, len(fields))
-
+	keyField := foundTable.getKeyField()
+	if keyField == nil {
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
+		log.Println("keyField == nil")
+		return
+	}
 	var idx = -1
 	for _, field := range fields {
 		idx++
@@ -276,7 +306,15 @@ func servePut(w http.ResponseWriter, r *http.Request, l *Router) {
 		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
 		return
 	}
-	serveAnswer(w, map[string]interface{}{"response": map[string]interface{}{"id": id}})
+	serveAnswer(w, map[string]interface{}{"response": map[string]interface{}{keyField.Name: id}})
+}
+
+func prepareUpdateQuery(tableName string, keyFieldName string, params map[string]interface{}) string {
+	values := make([]string, 0)
+	for k := range params {
+		values = append(values, fmt.Sprintf("%s = ?", k))
+	}
+	return fmt.Sprintf("update %s set %s where %s = ?", tableName, strings.Join(values, ","),keyFieldName)
 }
 
 func (tDesc TableDesc) prepInsertSqlQuery() string {
@@ -293,14 +331,157 @@ func (tDesc TableDesc) prepInsertSqlQuery() string {
 	return fmt.Sprintf("insert into %s (%s) values (%s)", tDesc.Name, strings.Join(values, ", "), strings.Join(placeholders, ", "))
 }
 
-//serveGet serves for http.MethodDelete requests
+//serveDelete serves for http.MethodDelete requests
 func serveDelete(w http.ResponseWriter, r *http.Request, l *Router) {
 	log.Printf("serveDelete %s %s", r.Method, r.URL.Path)
+
+	pathSegments := strings.Split(r.URL.Path, "/")
+
+	if len(pathSegments) != 3 {
+		RespError{HTTPStatus: http.StatusNotFound, Error: "Not Found"}.serve(w)
+		return
+	}
+
+	searchTable := pathSegments[1]
+
+	var ok bool
+	var foundTable TableDesc
+	if foundTable, ok = l.desc.tables[searchTable]; !ok {
+		RespError{HTTPStatus: http.StatusNotFound, Error: "unknown table"}.serve(w)
+		return
+	}
+
+	id, err := strconv.Atoi(pathSegments[2])
+	if err != nil {
+		RespError{HTTPStatus: http.StatusNotFound, Error: "unknown id"}.serve(w)
+		return
+	}
+
+	sqlQuery := fmt.Sprintf("delete from %s where id = ?", foundTable.Name)
+	log.Println("sql query:", sqlQuery)
+	res, err := l.db.Exec(sqlQuery, id)
+	if err != nil {
+		log.Println("err db.Exec:", err)
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
+		return
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
+		return
+	}
+	serveAnswer(w, map[string]interface{}{"response": map[string]interface{}{"deleted": rowsAffected}})
 }
 
-//serveGet serves for http.MethodPost requests
+//servePost serves for http.MethodPost requests
 func servePost(w http.ResponseWriter, r *http.Request, l *Router) {
 	log.Printf("servePost %s %s", r.Method, r.URL.Path)
+
+	pathSegments := strings.Split(r.URL.Path, "/")
+
+	if len(pathSegments) != 3 {
+		RespError{HTTPStatus: http.StatusNotFound, Error: "Not Found"}.serve(w)
+		return
+	}
+
+	searchTable := pathSegments[1]
+
+	var ok bool
+	var foundTable TableDesc
+	if foundTable, ok = l.desc.tables[searchTable]; !ok {
+		RespError{HTTPStatus: http.StatusNotFound, Error: "unknown table"}.serve(w)
+		return
+	}
+
+	id, err := strconv.Atoi(pathSegments[2])
+	if err != nil {
+		RespError{HTTPStatus: http.StatusNotFound, Error: "unknown id"}.serve(w)
+		return
+	}
+
+	fields := foundTable.getFieldsArray()
+	fieldsLen := len(fields)
+
+	decoder := json.NewDecoder(r.Body)
+	requestParams := make(map[string]interface{}, fieldsLen)
+	err = decoder.Decode(&requestParams)
+	if err != nil {
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "can't parse a body"}.serve(w)
+		return
+	}
+	log.Println("requestParams: ", requestParams)
+	keyField := foundTable.getKeyField()
+	if keyField == nil {
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
+		log.Println("keyField == nil")
+		return
+	}
+
+
+	for k, v := range requestParams {
+		log.Println("requestParams: k:", k, "v:", v)
+		if k == keyField.Name { // id is not allowed to change
+			RespError{HTTPStatus: http.StatusBadRequest, Error: fmt.Sprintf("field %s have invalid type", keyField.Name)}.serve(w)
+			return
+		}
+
+		if foundField, ok := foundTable.fields[k]; ok {
+
+			fmt.Println(foundField)
+			var isInvalidType = false
+			switch casted := v.(type) {
+			case int:
+				if foundField.Type != "int" {
+					isInvalidType = true
+				}
+			case float64:
+				if foundField.Type != "int" {
+					isInvalidType = true
+				}
+			case string:
+				if foundField.Type == "int" {
+					isInvalidType = true
+				}
+			default:
+				if !foundField.Nullable {
+					log.Println(casted)
+					isInvalidType = true
+				} else {
+					requestParams[k] = sql.NullString{}
+				}
+			}
+			if isInvalidType {
+				RespError{HTTPStatus: http.StatusBadRequest, Error: "field " + foundField.Name + " have invalid type"}.serve(w)
+				return
+			}
+		}
+	}
+
+
+	sqlQ := prepareUpdateQuery(foundTable.Name, keyField.Name, requestParams)
+	log.Println("sql query:", sqlQ)
+
+	preparedParams := make([]interface{}, 0)
+	for _, v := range requestParams {
+		preparedParams = append(preparedParams, v)
+	}
+	preparedParams = append(preparedParams, id)
+
+	res, err := l.db.Exec(sqlQ, preparedParams...)
+	if err != nil {
+		log.Println("err db.Exec:", err)
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
+		return
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
+		return
+	}
+
+	serveAnswer(w, map[string]interface{}{"response": map[string]interface{}{"updated": rowsAffected}})
 }
 
 //serveGet serves for http.MethodGet requests
@@ -330,7 +511,13 @@ func serveGet(w http.ResponseWriter, r *http.Request, l *Router) {
 
 func serveRowById(db *sql.DB, w http.ResponseWriter, desc DbDesc, tableName string, id string) {
 	if foundTable, ok := desc.tables[tableName]; ok {
-		sqlQ := fmt.Sprintf("SELECT * FROM %s WHERE id = ?", tableName)
+		keyField := foundTable.getKeyField()
+		if keyField == nil {
+			RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
+			log.Println("keyField == nil")
+			return
+		}
+		sqlQ := fmt.Sprintf("SELECT * FROM %s WHERE %s = ?", tableName, keyField.Name)
 		res, err := db.Query(sqlQ, id)
 		if err != nil {
 			RespError{HTTPStatus: http.StatusInternalServerError, Error: "Internal Server Error"}.serve(w)
